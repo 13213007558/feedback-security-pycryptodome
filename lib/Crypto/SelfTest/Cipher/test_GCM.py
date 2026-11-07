@@ -871,6 +871,7 @@ class TestGcmThreads:
     def tiny_ranges(self, monkeypatch):
         # Let each thread process even a single block
         monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_PER_THREAD", 1)
+        monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_OUTPUT", 0)
         monkeypatch.setattr(_mode_gcm, "_MIN_BYTES_PER_THREAD_CLMUL", 16)
         monkeypatch.setattr(_mode_gcm, "_MIN_BYTES_PER_THREAD_PORTABLE", 16)
 

@@ -35,12 +35,14 @@ from Crypto import MessageTooLongError
 from Crypto.Cipher._state_machine import Method
 from Crypto.Random import get_random_bytes
 from Crypto.Util._raw_api import (
+    _MIN_BYTES_OUTPUT,
     SmartPointer,
     VoidPointer,
     c_size_t,
     c_uint8_ptr_len,
     c_uint8_ptr_out,
     create_output_buffer,
+    create_string_buffer,
     get_raw_buffer,
     is_writeable_buffer,
     load_pycryptodome_raw_lib,
@@ -345,6 +347,17 @@ class CtrMode:
         self, data: Buffer, output: Optional[Union[bytearray, memoryview]], what: str
     ) -> Optional[bytes]:
         """Encrypt or decrypt (which are the same operation in CTR mode)"""
+
+        # Short messages spend most of their time here, not in the cipher.
+        # A bytes object cannot change during the call, and the output is ours,
+        # so this path skips what protects shared buffers.
+        if output is None and type(data) is bytes and len(data) < _MIN_BYTES_OUTPUT:
+            data_len = len(data)
+            buffer = create_string_buffer(data_len)
+            result = raw_ctr_lib.CTR_encrypt(self._state.get(), data, buffer, c_size_t(data_len))
+            if result:
+                self._check(result, what)
+            return get_raw_buffer(buffer)
 
         if output is None:
             result_buffer = create_output_buffer(len(data))

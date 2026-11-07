@@ -5,6 +5,7 @@ from binascii import hexlify, unhexlify
 
 import pytest
 
+from Crypto import MessageTooLongError
 from Crypto.Cipher import AES, DES, DES3, _mode_ctr
 from Crypto.Hash import SHA256, SHAKE128
 from Crypto.Util import Counter, _raw_api
@@ -325,6 +326,8 @@ class TestCtrThreads:
     def tiny_ranges(self, monkeypatch):
         # Let each thread process even a single byte
         monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_PER_THREAD", 1)
+        # Short messages never reach the threads otherwise
+        monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_OUTPUT", 0)
 
     def test_threads_negative(self):
         for threads in (1.0, "2", None, True):
@@ -486,6 +489,7 @@ class TestCtrBytesOutput:
     @pytest.fixture(autouse=True)
     def direct_output(self, monkeypatch):
         monkeypatch.setattr(_raw_api, "_MIN_BYTES_OUTPUT", 1)
+        monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_OUTPUT", 1)
         monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_PER_THREAD", 1)
 
     @pytest.mark.parametrize("threads", (1, 3))
@@ -528,6 +532,67 @@ class TestCtrBytesOutput:
         assert type(result[0]) is bytes
         cipher = AES.new(self.key_128, AES.MODE_GCM, nonce=self.nonce_64)
         assert cipher.decrypt_and_verify(*ref) == pt
+
+
+class TestCtrShortBytes:
+    """The shortcut for bytes must give the same result as the general code"""
+
+    key = bytes(range(16))
+    nonce = bytes(range(8))
+
+    @pytest.fixture(params=[True, False], ids=["default", "general"])
+    def general_path(self, request, monkeypatch):
+        if not request.param:
+            monkeypatch.setattr(_mode_ctr, "_MIN_BYTES_OUTPUT", 0)
+
+    def new(self):
+        return AES.new(self.key, AES.MODE_CTR, nonce=self.nonce)
+
+    @pytest.mark.parametrize(
+        "length",
+        [0, 1, 15, 16, 17, 255, 256, 257, 4096, _raw_api._MIN_BYTES_OUTPUT - 1, _raw_api._MIN_BYTES_OUTPUT],
+    )
+    @pytest.mark.parametrize("operation", ["encrypt", "decrypt"])
+    def test_same_result(self, length, operation, general_path):
+        data = SHAKE128.new(b"data").read(length)
+        expected = getattr(self.new(), operation)(bytearray(data))
+        result = getattr(self.new(), operation)(data)
+        assert type(result) is bytes
+        assert result == expected
+
+    def test_threads(self, general_path):
+        data = bytes(1000)
+        assert AES.new(self.key, AES.MODE_CTR, nonce=self.nonce, threads=4).encrypt(
+            data
+        ) == self.new().encrypt(data)
+
+    def test_pieces(self, general_path):
+        data = SHAKE128.new(b"data").read(1000)
+        cipher = self.new()
+        assert cipher.encrypt(data[:7]) + cipher.encrypt(data[7:300]) + cipher.encrypt(
+            data[300:]
+        ) == self.new().encrypt(data)
+
+    def test_bytes_subclass(self, general_path):
+        class Data(bytes):
+            pass
+
+        data = b"\x01" * 40
+        assert self.new().encrypt(Data(data)) == self.new().encrypt(data)
+
+    def test_key_stream_exhausted(self, general_path):
+        cipher = AES.new(self.key, AES.MODE_CTR, nonce=bytes(15))
+        cipher.encrypt(bytes(255 * 16))
+        with pytest.raises(MessageTooLongError):
+            cipher.encrypt(bytes(17))
+        # Nothing was processed, so the remaining block can still be used
+        assert len(cipher.encrypt(bytes(16))) == 16
+
+    def test_method_order(self, general_path):
+        cipher = self.new()
+        cipher.encrypt(b"a")
+        with pytest.raises(TypeError):
+            cipher.decrypt(b"a")
 
 
 class TestSP800TestVectors:
