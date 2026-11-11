@@ -722,3 +722,342 @@ def test_low_order_non_canonical(curve, x):
     assert point.x < int(ECC._curves[curve].p)
     with pytest.raises(ValueError, match="Invalid"):
         ECC.construct(curve=curve, point_x=x)
+
+
+class CountingKDF:
+    """KDF test double that records every invocation.
+
+    If ``func`` is given, it is applied to the shared secret to produce
+    the return value; otherwise the shared secret is returned as-is.
+    """
+
+    def __init__(self, func=None):
+        self.func = func
+        self.inputs = []
+
+    def __call__(self, z):
+        self.inputs.append(bytes(z))
+        if self.func is not None:
+            return self.func(z)
+        return z
+
+
+def _ref_hkdf_sha256(ikm, salt, info, length):
+    """Independent HKDF-SHA256 (RFC 5869) based on hashlib/hmac,
+    used to cross-check Crypto.Protocol.KDF.HKDF."""
+    import hashlib
+    import hmac
+
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm = b""
+    t = b""
+    counter = 1
+    while len(okm) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        okm += t
+        counter += 1
+    return okm[:length]
+
+
+class TestKeyAgreementRejectsUntrustedInputBeforeKDF:
+    """Untrusted input to key_agreement must be rejected before the
+    application KDF ever sees a shared secret.
+
+    Each test pins down *where* the rejection happens:
+      - import stage: import_x25519/x448_public_key() raises ValueError
+      - key agreement stage: key_agreement() raises TypeError (misuse:
+        wrong curve or wrong key role) or ValueError (invalid ECDH point)
+      - KDF stage: only the application KDF itself may fail, and only
+        after it was actually called with a valid shared secret
+    """
+
+    # RFC 7748, Section 6.1 (X25519, Alice and Bob)
+    x25519_alice_priv = unhexlify("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    x25519_alice_pub = unhexlify("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    x25519_bob_priv = unhexlify("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    x25519_bob_pub = unhexlify("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    x25519_shared = unhexlify("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+
+    # RFC 7748, Section 5 (X25519, first test vector)
+    x25519_tv1_priv = unhexlify("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
+    x25519_tv1_pub = unhexlify("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+    x25519_tv1_shared = unhexlify("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+
+    # RFC 7748, Section 6.2 (X448, Alice and Bob)
+    x448_alice_priv = unhexlify(
+        "9a8f4925d1519f5775cf46b04b5800d4ee9ee8bae8bc5565d498c28dd9c9baf5"
+        "74a9419744897391006382a6f127ab1d9ac2d8c0a598726b"
+    )
+    x448_alice_pub = unhexlify(
+        "9b08f7cc31b7e3e67d22d5aea121074a273bd2b83de09c63faa73d2c22c5d9"
+        "bbc836647241d953d40c5b12da88120d53177f80e532c41fa0"
+    )
+    x448_bob_priv = unhexlify(
+        "1c306a7ac2a0e2e0990b294470cba339e6453772b075811d8fad0d1d6927c120"
+        "bb5ee8972b0d3e21374c9c921b09d1b0366f10b65173992d"
+    )
+    x448_bob_pub = unhexlify(
+        "3eb7a829b0cd20f5bcfc0b599b6feccf6da4627107bdb0d4f345b43027d8b972"
+        "fc3e34fb4232a13ca706dcb57aec3dae07bdc1c67bf33609"
+    )
+    x448_shared = unhexlify(
+        "07fff4181ac6cc95ec1c16a94a0f74d12da232ce40a77552281d282bb60c0b56"
+        "fd2464c335543936521c24403085d59a449a5037514a879d"
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 1: rejection at public key import time
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "encoded",
+        [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "aa" * 31,
+            "aa" * 33,
+        ],
+        ids=[
+            "low-order-zero",
+            "low-order-one",
+            "low-order-3",
+            "low-order-p-minus-1",
+            "non-canonical-p",
+            "too-short-31",
+            "too-long-33",
+        ],
+    )
+    def test_x25519_malformed_public_key_rejected_at_import(self, encoded):
+        kdf = CountingKDF()
+        with pytest.raises(ValueError):
+            import_x25519_public_key(unhexlify(encoded))
+        assert kdf.inputs == []
+
+    @pytest.mark.parametrize(
+        "encoded",
+        [
+            "00" * 56,
+            "01" + "00" * 55,
+            "fefffffffffffffffffffffffffffffffffffffffffffffffffffffffe"
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffe"
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "aa" * 55,
+            "aa" * 57,
+        ],
+        ids=[
+            "low-order-zero",
+            "low-order-one",
+            "low-order-p-minus-1",
+            "non-canonical-p",
+            "too-short-55",
+            "too-long-57",
+        ],
+    )
+    def test_x448_malformed_public_key_rejected_at_import(self, encoded):
+        kdf = CountingKDF()
+        with pytest.raises(ValueError):
+            import_x448_public_key(unhexlify(encoded))
+        assert kdf.inputs == []
+
+    # ------------------------------------------------------------------
+    # Stage 2: rejection by key_agreement itself (KDF never called)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "priv_curve, pub_curve",
+        [
+            ("Curve25519", "Curve448"),
+            ("Curve448", "Curve25519"),
+            ("Curve25519", "P-256"),
+        ],
+        ids=["x25519-priv-x448-pub", "x448-priv-x25519-pub", "x25519-priv-p256-pub"],
+    )
+    def test_mixed_curves_rejected_by_key_agreement(self, priv_curve, pub_curve):
+        kdf = CountingKDF()
+        with pytest.raises(TypeError, match="incompatible curve"):
+            key_agreement(
+                kdf=kdf,
+                static_priv=ECC.generate(curve=priv_curve),
+                static_pub=ECC.generate(curve=pub_curve).public_key(),
+            )
+        assert kdf.inputs == []
+
+    @pytest.mark.parametrize("slot", ["static_priv", "eph_priv"])
+    def test_private_role_given_public_key(self, slot):
+        # A public-only key must not be accepted where a private key is required
+        priv = ECC.generate(curve="Curve25519")
+        peer_pub = ECC.generate(curve="Curve25519").public_key()
+        kdf = CountingKDF()
+        kwargs = {"kdf": kdf, slot: priv.public_key()}
+        kwargs["static_pub" if slot == "eph_priv" else "eph_pub"] = peer_pub
+        with pytest.raises(TypeError, match="must be a private ECC key"):
+            key_agreement(**kwargs)
+        assert kdf.inputs == []
+
+    @pytest.mark.parametrize("slot", ["static_priv", "static_pub", "eph_priv", "eph_pub"])
+    def test_key_slot_given_non_ecc_object(self, slot):
+        priv = ECC.generate(curve="Curve25519")
+        kdf = CountingKDF()
+        kwargs = {
+            "kdf": kdf,
+            "static_priv": priv,
+            "static_pub": ECC.generate(curve="Curve25519").public_key(),
+        }
+        kwargs[slot] = b"\x01" * 32  # raw bytes are not an EccKey
+        with pytest.raises(TypeError, match="must be an ECC key"):
+            key_agreement(**kwargs)
+        assert kdf.inputs == []
+
+    def test_too_few_keys_rejected_by_key_agreement(self):
+        kdf = CountingKDF()
+        with pytest.raises(ValueError, match="Too few keys"):
+            key_agreement(kdf=kdf, static_priv=ECC.generate(curve="Curve25519"))
+        assert kdf.inputs == []
+
+    @pytest.mark.parametrize("curve", ["Curve25519", "Curve448"])
+    def test_valid_static_pair_but_invalid_ephemeral_pub(self, curve):
+        # C(2e, 2s): the static half is fully valid, but the ephemeral
+        # public key from the peer is the point at infinity
+        static_priv = ECC.generate(curve=curve)
+        static_pub = ECC.generate(curve=curve).public_key()
+        eph_priv = ECC.generate(curve=curve)
+        pai_pub = ECC.EccKey(curve=curve, point=eph_priv.pointQ.point_at_infinity())
+        kdf = CountingKDF()
+        with pytest.raises(ValueError, match="Invalid ECDH point"):
+            key_agreement(
+                kdf=kdf,
+                static_priv=static_priv,
+                static_pub=static_pub,
+                eph_priv=eph_priv,
+                eph_pub=pai_pub,
+            )
+        assert kdf.inputs == []
+
+    @pytest.mark.parametrize("curve", ["Curve25519", "Curve448"])
+    def test_valid_ephemeral_pair_but_invalid_static_pub(self, curve):
+        # C(2e, 2s): the ephemeral half is fully valid, but the static
+        # public key from the peer is the point at infinity
+        static_priv = ECC.generate(curve=curve)
+        pai_pub = ECC.EccKey(curve=curve, point=static_priv.pointQ.point_at_infinity())
+        eph_priv = ECC.generate(curve=curve)
+        eph_pub = ECC.generate(curve=curve).public_key()
+        kdf = CountingKDF()
+        with pytest.raises(ValueError, match="Invalid ECDH point"):
+            key_agreement(
+                kdf=kdf,
+                static_priv=static_priv,
+                static_pub=pai_pub,
+                eph_priv=eph_priv,
+                eph_pub=eph_pub,
+            )
+        assert kdf.inputs == []
+
+    def test_valid_static_pair_but_ephemeral_on_other_curve(self):
+        # C(2e, 2s): static keys are a consistent X25519 pair, but the
+        # ephemeral private key lives on X448
+        kdf = CountingKDF()
+        with pytest.raises(TypeError, match="incompatible curve"):
+            key_agreement(
+                kdf=kdf,
+                static_priv=ECC.generate(curve="Curve25519"),
+                static_pub=ECC.generate(curve="Curve25519").public_key(),
+                eph_priv=ECC.generate(curve="Curve448"),
+                eph_pub=ECC.generate(curve="Curve448").public_key(),
+            )
+        assert kdf.inputs == []
+
+    # ------------------------------------------------------------------
+    # Stage 3: failure inside the application KDF itself
+    # ------------------------------------------------------------------
+
+    def test_kdf_exception_is_application_failure(self):
+        # With valid keys, key_agreement computes a well-formed shared
+        # secret and hands it to the KDF exactly once; any exception at
+        # that point comes from the application KDF, not from validation.
+        def broken_kdf(z):
+            raise RuntimeError("application KDF failed")
+
+        kdf = CountingKDF(broken_kdf)
+        with pytest.raises(RuntimeError, match="application KDF failed"):
+            key_agreement(
+                kdf=kdf,
+                static_priv=import_x25519_private_key(self.x25519_alice_priv),
+                static_pub=import_x25519_public_key(self.x25519_bob_pub),
+            )
+        assert kdf.inputs == [self.x25519_shared]
+
+    # ------------------------------------------------------------------
+    # Valid combinations, checked with a real KDF (HKDF-SHA256)
+    # ------------------------------------------------------------------
+
+    def _hkdf(self, salt, info):
+        from Crypto.Protocol.KDF import HKDF
+
+        return lambda z: HKDF(master=z, key_len=32, salt=salt, hashmod=SHA256, context=info)
+
+    def test_x25519_static_pair_with_real_kdf(self):
+        salt = unhexlify("000102030405060708090a0b0c0d0e0f")
+        info = b"pycryptodome-test"
+        expected = _ref_hkdf_sha256(self.x25519_shared, salt, info, 32)
+
+        kdf_alice = CountingKDF(self._hkdf(salt, info))
+        kdf_bob = CountingKDF(self._hkdf(salt, info))
+        key_alice = key_agreement(
+            kdf=kdf_alice,
+            static_priv=import_x25519_private_key(self.x25519_alice_priv),
+            static_pub=import_x25519_public_key(self.x25519_bob_pub),
+        )
+        key_bob = key_agreement(
+            kdf=kdf_bob,
+            static_priv=import_x25519_private_key(self.x25519_bob_priv),
+            static_pub=import_x25519_public_key(self.x25519_alice_pub),
+        )
+        assert key_alice == expected
+        assert key_bob == expected
+        assert kdf_alice.inputs == [self.x25519_shared]
+        assert kdf_bob.inputs == [self.x25519_shared]
+
+    def test_x448_static_pair_with_real_kdf(self):
+        salt = unhexlify("f0e1d2c3b4a5968778695a4b3c2d1e0f")
+        info = b"pycryptodome-test-x448"
+        expected = _ref_hkdf_sha256(self.x448_shared, salt, info, 32)
+
+        kdf_alice = CountingKDF(self._hkdf(salt, info))
+        kdf_bob = CountingKDF(self._hkdf(salt, info))
+        key_alice = key_agreement(
+            kdf=kdf_alice,
+            static_priv=import_x448_private_key(self.x448_alice_priv),
+            static_pub=import_x448_public_key(self.x448_bob_pub),
+        )
+        key_bob = key_agreement(
+            kdf=kdf_bob,
+            static_priv=import_x448_private_key(self.x448_bob_priv),
+            static_pub=import_x448_public_key(self.x448_alice_pub),
+        )
+        assert key_alice == expected
+        assert key_bob == expected
+        assert kdf_alice.inputs == [self.x448_shared]
+        assert kdf_bob.inputs == [self.x448_shared]
+
+    def test_x25519_static_and_ephemeral_with_real_kdf(self):
+        # C(2e, 2s): Z = Ze || Zs, with Ze from the RFC 7748 Section 5
+        # test vector and Zs from the Alice/Bob exchange of Section 6.1
+        z = self.x25519_tv1_shared + self.x25519_shared
+        salt = unhexlify("00112233445566778899aabbccddeeff")
+        info = b"pycryptodome-test-2e2s"
+        expected = _ref_hkdf_sha256(z, salt, info, 32)
+
+        kdf = CountingKDF(self._hkdf(salt, info))
+        key = key_agreement(
+            kdf=kdf,
+            static_priv=import_x25519_private_key(self.x25519_alice_priv),
+            static_pub=import_x25519_public_key(self.x25519_bob_pub),
+            eph_priv=import_x25519_private_key(self.x25519_tv1_priv),
+            eph_pub=import_x25519_public_key(self.x25519_tv1_pub),
+        )
+        assert key == expected
+        assert kdf.inputs == [z]
