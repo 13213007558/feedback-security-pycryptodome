@@ -6,6 +6,12 @@ Changelog
 
 New features
 ------------
+* Added the method ``decrypt_and_verify_safely()`` to the GCM, EAX and
+  ChaCha20-Poly1305 AEAD ciphers. Unlike ``decrypt_and_verify()``, the plaintext
+  is produced in a temporary buffer and copied into the ``output`` parameter only
+  after the MAC tag is validated: if the tag is wrong, the caller's buffer is
+  left completely untouched, so no unauthenticated plaintext is ever exposed.
+  The additional safety requires an extra buffer as long as the message.
 * Added the mode ``MODE_GCM_SIV`` to ``Crypto.Cipher.AES`` (AES-GCM-SIV, RFC 8452),
   for authenticated encryption that is resistant to the reuse of a nonce.
 * Added the mode ``MODE_XTS`` to ``Crypto.Cipher.AES`` (IEEE 1619, NIST SP 800-38E),

@@ -304,6 +304,164 @@ class TestXChaCha20Poly1305:
         cipher.decrypt_and_verify(ct, tag)
 
 
+class TestChaCha20Poly1305DecryptAndVerifySafely:
+    key_256 = get_tag_random("key_256", 32)
+    nonce_96 = get_tag_random("nonce_96", 12)
+    data = get_tag_random("data", 128)
+    header = get_tag_random("header", 33)
+
+    def _ciphertext(self):
+        cipher = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        cipher.update(self.header)
+        return cipher.encrypt_and_digest(self.data)
+
+    def _new_decryptor(self):
+        cipher = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        cipher.update(self.header)
+        return cipher
+
+    def test_matches_existing_api(self):
+        ct, tag = self._ciphertext()
+
+        cipher = self._new_decryptor()
+        reference = cipher.decrypt_and_verify(ct, tag)
+
+        cipher = self._new_decryptor()
+        result = cipher.decrypt_and_verify_safely(ct, tag)
+
+        assert result == reference
+        assert result == self.data
+        assert type(result) is bytes
+
+    def test_success_with_output(self):
+        ct, tag = self._ciphertext()
+
+        result = bytearray(len(ct))
+        ret = self._new_decryptor().decrypt_and_verify_safely(ct, tag, output=result)
+
+        assert ret is None
+        assert bytes(result) == self.data
+
+    def test_bytearray_untouched_on_bad_tag(self):
+        ct, tag = self._ciphertext()
+        bad_tag = bytearray(tag)
+        bad_tag[0] ^= 0x01
+
+        output = bytearray(get_tag_random("sentinel", len(ct)))
+        original = bytes(output)
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(ct, bad_tag, output=output)
+        # The whole caller buffer must keep its previous content
+        assert bytes(output) == original
+        assert output == bytearray(original)
+
+    def test_sliced_memoryview_untouched_on_bad_tag(self):
+        ct, tag = self._ciphertext()
+        bad_tag = bytearray(tag)
+        bad_tag[-1] ^= 0xFF
+
+        backing = bytearray(get_tag_random("backing", len(ct) + 40))
+        original = bytes(backing)
+        output = memoryview(backing)[20:20 + len(ct)]
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(ct, bad_tag, output=output)
+        # Both the slice and the surrounding backing storage are unchanged
+        assert bytes(output) == original[20:20 + len(ct)]
+        assert bytes(backing) == original
+
+    def test_sliced_memoryview_success(self):
+        ct, tag = self._ciphertext()
+        backing = bytearray(len(ct) + 40)
+        output = memoryview(backing)[20:20 + len(ct)]
+        ret = self._new_decryptor().decrypt_and_verify_safely(ct, tag, output=output)
+        assert ret is None
+        assert bytes(output) == self.data
+        assert backing[:20] == b"\x00" * 20
+        assert backing[20 + len(ct):] == b"\x00" * 20
+
+    def test_overlapping_input_and_output(self):
+        ct, tag = self._ciphertext()
+
+        # In-place decryption: output aliases the ciphertext
+        buffer = bytearray(ct)
+        ret = self._new_decryptor().decrypt_and_verify_safely(buffer, tag, output=buffer)
+        assert ret is None
+        assert bytes(buffer) == self.data
+
+        # On failure, the aliased buffer still holds the original ciphertext
+        buffer = bytearray(ct)
+        original = bytes(buffer)
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(
+                buffer, b"\x00" * len(tag), output=buffer
+            )
+        assert bytes(buffer) == original
+
+        # Partial overlap through memoryview slices of the same backing store
+        backing = bytearray(b"\xAA" * 16 + ct + b"\xBB" * 16)
+        original = bytes(backing)
+        in_view = memoryview(backing)[16:16 + len(ct)]
+        out_view = memoryview(backing)[:len(ct)]
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(
+                in_view, b"\x00" * len(tag), output=out_view
+            )
+        assert bytes(backing) == original
+
+    def test_wrong_output_length(self):
+        ct, tag = self._ciphertext()
+
+        output = bytearray(get_tag_random("sentinel", len(ct) - 1))
+        original = bytes(output)
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(ct, tag, output=output)
+        assert bytes(output) == original
+
+        output = bytearray(len(ct) + 1)
+        original = bytes(output)
+        with pytest.raises(ValueError):
+            self._new_decryptor().decrypt_and_verify_safely(ct, tag, output=output)
+        assert bytes(output) == original
+
+    def test_readonly_output_rejected(self):
+        ct, tag = self._ciphertext()
+        with pytest.raises(TypeError):
+            self._new_decryptor().decrypt_and_verify_safely(ct, tag, output=b"0" * len(ct))
+        with pytest.raises(TypeError):
+            self._new_decryptor().decrypt_and_verify_safely(
+                ct, tag, output=memoryview(b"0" * len(ct))
+            )
+
+    def test_bad_tag_length(self):
+        ct, tag = self._ciphertext()
+        output = bytearray(get_tag_random("sentinel", len(ct)))
+        original = bytes(output)
+        # ChaCha20-Poly1305 tags are always 16 bytes long
+        for bad_tag in (tag[:15], tag + b"\x00"):
+            output = bytearray(original)
+            with pytest.raises(ValueError):
+                self._new_decryptor().decrypt_and_verify_safely(ct, bad_tag, output=output)
+            assert bytes(output) == original
+
+    def test_empty_message(self):
+        cipher = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        ct, tag = cipher.encrypt_and_digest(b"")
+
+        decryptor = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        assert decryptor.decrypt_and_verify_safely(ct, tag) == b""
+
+        output = bytearray(b"unchanged")
+        original = bytes(output)
+        decryptor = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        ret = decryptor.decrypt_and_verify_safely(ct, tag, output=memoryview(output)[:0])
+        assert ret is None
+        assert bytes(output) == original
+
+        decryptor = ChaCha20_Poly1305.new(key=self.key_256, nonce=self.nonce_96)
+        with pytest.raises(ValueError):
+            decryptor.decrypt_and_verify_safely(ct, b"\x00" * 15, output=bytearray())
+
+
 class TestChaCha20Poly1305FSM:
     key_256 = get_tag_random("key_256", 32)
     nonce_96 = get_tag_random("nonce_96", 12)

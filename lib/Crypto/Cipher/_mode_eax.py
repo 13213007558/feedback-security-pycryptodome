@@ -18,7 +18,7 @@ from binascii import unhexlify
 from Crypto.Cipher._state_machine import Method
 from Crypto.Hash import CMAC
 from Crypto.Random import get_random_bytes
-from Crypto.Util._raw_api import is_buffer
+from Crypto.Util._raw_api import is_buffer, is_writeable_buffer
 from Crypto.Util.number import bytes_to_long
 from Crypto.Util.strxor import strxor
 
@@ -385,6 +385,80 @@ class EaxMode:
         pt = self.decrypt(ciphertext, output=output)
         self.verify(received_mac_tag)
         return pt
+
+    @overload
+    def decrypt_and_verify_safely(
+        self, ciphertext: Buffer, received_mac_tag: Buffer
+    ) -> bytes: ...
+
+    @overload
+    def decrypt_and_verify_safely(
+        self, ciphertext: Buffer,
+        received_mac_tag: Buffer,
+        output: Union[bytearray, memoryview],
+    ) -> None: ...
+
+    def decrypt_and_verify_safely(
+        self,
+        ciphertext: Buffer,
+        received_mac_tag: Buffer,
+        output: Optional[Union[bytearray, memoryview]] = None,
+    ) -> Optional[bytes]:
+        """Perform decrypt() and verify() in one step, without ever exposing
+        unauthenticated plaintext.
+
+        Unlike :meth:`decrypt_and_verify`, the plaintext is always produced in
+        a temporary buffer first. It is copied into ``output`` only after the
+        MAC tag has been validated. If the MAC does not match, ``output`` is
+        left completely untouched (it keeps the data it had before this call),
+        and no unauthenticated plaintext is ever written into it.
+
+        The low-level streaming interface (``decrypt`` followed by ``verify``)
+        is unchanged: it still writes into ``output`` as data is processed.
+
+        The extra safety has a memory cost: an additional buffer as long as
+        the ciphertext is allocated, so up to twice the memory of the message
+        is in use at the same time.
+
+        Args:
+            ciphertext (bytes/bytearray/memoryview):
+                The piece of data to decrypt.
+            received_mac_tag (bytes/bytearray/memoryview):
+                This is the *binary* MAC, as received from the sender.
+        Keyword Args:
+            output (bytearray/memoryview):
+                The location where the plaintext must be written to.
+                It must have the same length as the ciphertext.
+                If ``None``, the plaintext is returned.
+        Returns:
+            the plaintext as ``bytes`` or ``None`` when the ``output``
+            parameter specified a location for the result.
+        Raises:
+            ValueError:
+                if the MAC does not match. The message has been tampered with
+                or the key is incorrect. ``output`` is not modified.
+        """
+
+        if output is not None:
+            if not is_writeable_buffer(output):
+                raise TypeError("output must be a bytearray or a writeable memoryview")
+            if len(ciphertext) != len(output):
+                raise ValueError(
+                    "output must have the same length as the input  (%d bytes)" % len(ciphertext)
+                )
+            # The output must stay untouched on any failure, so validate
+            # the tag length before decrypting into the temporary buffer
+            if not (2 <= len(received_mac_tag) <= self._mac_len):
+                raise ValueError("MAC check failed")
+            temporary = bytearray(len(ciphertext))
+            plaintext = self.decrypt(ciphertext, output=temporary)
+            self.verify(received_mac_tag)
+            output[:] = temporary
+            return plaintext
+
+        plaintext = self.decrypt(ciphertext)
+        self.verify(received_mac_tag)
+        return plaintext
 
 
 def _create_eax_cipher(factory, **kwargs):

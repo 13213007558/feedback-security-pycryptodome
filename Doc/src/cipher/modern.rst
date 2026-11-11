@@ -59,6 +59,12 @@ in classic modes of operation, a cipher object for an AEAD mode has these method
     * - ``decrypt_and_verify(ciphertext, tag)``
       - :meth:`decrypt` and ``verify()`` in one call:
         returns the plaintext, or raises ``ValueError`` if the tag is not valid.
+    * - ``decrypt_and_verify_safely(ciphertext, tag, output=None)``
+      - Like ``decrypt_and_verify()``, but the plaintext is written into ``output``
+        only *after* the tag has been validated (GCM, EAX and ChaCha20-Poly1305).
+        If the tag is not valid, ``ValueError`` is raised and ``output`` is left
+        completely untouched, so no unauthenticated plaintext ever reaches it.
+        The extra safety costs one additional buffer, as long as the message.
 
 The full API of each mode is at the end of its section below
 (for instance, :class:`~Crypto.Cipher._mode_gcm.GcmMode` for GCM).
