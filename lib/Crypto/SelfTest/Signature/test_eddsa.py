@@ -5,7 +5,7 @@ from binascii import unhexlify
 
 import pytest
 
-from Crypto.Hash import SHA512, SHAKE256
+from Crypto.Hash import SHA256, SHA512, SHAKE256
 from Crypto.PublicKey import ECC
 from Crypto.SelfTest.loader import load_test_vectors_wycheproof, wycheproof_id
 from Crypto.Signature import eddsa
@@ -552,3 +552,326 @@ def test_s_not_reduced(curve):
         bad = signature[:half] + s.to_bytes(half, "little")
         with pytest.raises(ValueError, match=r"\(S\)"):
             verifier.verify(b"message", bad)
+
+
+class TestInputContract:
+    """Raw message bytes, digest bytes, and hash objects are NOT
+    interchangeable inputs to ``sign()``/``verify()``:
+
+    - ``bytes`` (or ``bytearray``) always select *PureEdDSA*, no matter
+      how long they are (a 64-byte string is a message, not a SHA-512
+      digest).
+    - A hash object (``SHA512`` for Ed25519, ``SHAKE256`` for Ed448)
+      always selects *HashEdDSA*; the pre-hash is taken from the object
+      state at call time.
+    - Any other hash object or non-buffer type is rejected.
+
+    The interface never guesses whether bytes were already hashed.
+    These tests pin the contract down with RFC 8032 vectors and
+    cross-mode rejection checks, not sign/verify roundtrips.
+    """
+
+    msg = b"abc"
+
+    # RFC 8032, section 7.3 (Ed25519ph of "abc", empty context)
+    ed25519ph_sk = unhexlify(
+        "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42"
+    )
+    ed25519ph_pk = unhexlify(
+        "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf"
+    )
+    ed25519ph_sig = unhexlify(
+        "98a70222f0b8121aa9d30f813d683f80"
+        "9e462b469c7ff87639499bb94e6dae41"
+        "31f85042463c2a355a2003d062adf5aa"
+        "a10b8c61e636062aaad11c2a26083406"
+    )
+    # RFC 8032, section 7.5 (Ed448ph of "abc", empty context)
+    ed448ph_sk = unhexlify(
+        "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42"
+        "ef7822e0d5104127dc05d6dbefde69e3ab2cec7c867c6e2c49"
+    )
+    ed448ph_pk = unhexlify(
+        "259b71c19f83ef77a7abd26524cbdb3161b590a48f7d17de3ee0ba9c52beb743"
+        "c09428a131d6b1b57303d90d8132c276d5ed3d5d01c0f53880"
+    )
+    ed448ph_sig = unhexlify(
+        "822f6901f7480f3d5f562c592994d9693602875614483256505600bbc281ae38"
+        "1f54d6bce2ea911574932f52a4e6cadd78769375ec3ffd1b801a0d9b3f4030cd"
+        "433964b6457ea39476511214f97469b57dd32dbc560a9a94d00bff07620464a3"
+        "ad203df7dc7ce360c3cd3696d9d9fab90f00"
+    )
+    # RFC 8032, section 7.2 (Ed25519ctx, context "foo")
+    ed25519ctx_sk = unhexlify(
+        "0305334e381af78f141cb666f6199f57bc3495335a256a95bd2a55bf546663f6"
+    )
+    ed25519ctx_pk = unhexlify(
+        "dfc9425e4f968f7f0c29f0259cf5f9aed6851c2bb4ad8bfb860cfee0ab248292"
+    )
+    ed25519ctx_msg = unhexlify("f726936d19c800494e3fdaff20b276a8")
+    ed25519ctx_sig = unhexlify(
+        "55a4cc2f70a54e04288c5f4cd1e45a7b"
+        "b520b36292911876cada7323198dd87a"
+        "8b36950b95130022907a7fb7c4e9b2d5"
+        "f6cca685a587b4b21f4b888e4e7edb0d"
+    )
+    # RFC 8032, section 7.4 (Ed448 with context "foo")
+    ed448ctx_sk = unhexlify(
+        "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463a"
+        "fbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e"
+    )
+    ed448ctx_pk = unhexlify(
+        "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c086"
+        "6aea01eb00742802b8438ea4cb82169c235160627b4c3a9480"
+    )
+    ed448ctx_msg = unhexlify("03")
+    ed448ctx_sig = unhexlify(
+        "d4f8f6131770dd46f40867d6fd5d5055de43541f8c5e35abbcd001b32a89f7d2"
+        "151f7647f11d8ca2ae279fb842d607217fce6e042f6815ea000c85741de5c8da"
+        "1144a6a1aba7f96de42505d7a7298524fda538fccbbb754f578c1cad10d54d0d"
+        "5428407e85dcbc98a49155c13764e66c3c00"
+    )
+
+    # --- Hash object state at call time -----------------------------
+
+    def test_ed25519ph_incremental_update_matches_rfc(self):
+        """A SHA-512 object fed in chunks is the same pre-hash."""
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        hashobj = SHA512.new()
+        hashobj.update(b"a")
+        hashobj.update(b"bc")
+        assert signer.sign(hashobj) == self.ed25519ph_sig
+
+    def test_ed448ph_incremental_update_matches_rfc(self):
+        key = eddsa.import_private_key(self.ed448ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        hashobj = SHAKE256.new()
+        hashobj.update(b"a")
+        hashobj.update(b"bc")
+        assert signer.sign(hashobj) == self.ed448ph_sig
+
+    def test_ed25519ph_update_after_sign_changes_input(self):
+        """Updating the hash object after sign() must not retroactively
+        change the produced signature, but it changes the next one."""
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        verifier = eddsa.new(eddsa.import_public_key(self.ed25519ph_pk), "rfc8032")
+
+        hashobj = SHA512.new(self.msg)
+        signature = signer.sign(hashobj)
+        assert signature == self.ed25519ph_sig
+
+        hashobj.update(b"more")
+        signature2 = signer.sign(hashobj)
+        assert signature2 != self.ed25519ph_sig
+        verifier.verify(SHA512.new(self.msg + b"more"), signature2)
+        # The old signature does not verify against the mutated state
+        with pytest.raises(ValueError):
+            verifier.verify(hashobj, self.ed25519ph_sig)
+
+    def test_ed448ph_sign_does_not_consume_xof(self):
+        """sign() must read the SHAKE256 pre-hash from a copy, so the
+        caller's object keeps its state and can be reused."""
+        key = eddsa.import_private_key(self.ed448ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+
+        hashobj = SHAKE256.new(self.msg)
+        signature = signer.sign(hashobj)
+        assert signature == self.ed448ph_sig
+        # Same object, second sign: identical result (not squeezed dry)
+        assert signer.sign(hashobj) == self.ed448ph_sig
+        # The XOF output is still at its start for the caller
+        assert hashobj.read(64) == SHAKE256.new(self.msg).read(64)
+
+    def test_ed448ph_copy_is_equivalent(self):
+        key = eddsa.import_private_key(self.ed448ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        hashobj = SHAKE256.new(self.msg)
+        assert signer.sign(hashobj.copy()) == self.ed448ph_sig
+
+    def test_ed25519ph_copy_is_equivalent(self):
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        hashobj = SHA512.new(self.msg)
+        assert signer.sign(hashobj.copy()) == self.ed25519ph_sig
+
+    # --- Digest bytes are a pure message, not a pre-hash ------------
+
+    def test_ed25519_digest_bytes_are_pure_message(self):
+        """Passing SHA-512(msg).digest() as bytes selects PureEdDSA over
+        the 64-byte string; it is NOT equivalent to Ed25519ph."""
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        verifier = eddsa.new(eddsa.import_public_key(self.ed25519ph_pk), "rfc8032")
+
+        digest = SHA512.new(self.msg).digest()
+        signature = signer.sign(digest)
+        assert signature != self.ed25519ph_sig
+        # It is a valid pure signature over the digest bytes themselves
+        verifier.verify(digest, signature)
+        # The RFC Ed25519ph signature does not verify with digest bytes
+        with pytest.raises(ValueError):
+            verifier.verify(digest, self.ed25519ph_sig)
+        # ... and the pure signature does not verify in ph mode
+        with pytest.raises(ValueError):
+            verifier.verify(SHA512.new(self.msg), signature)
+
+    def test_ed448_digest_bytes_are_pure_message(self):
+        """Passing SHAKE256(msg).read(64) as bytes selects PureEdDSA;
+        it is NOT equivalent to Ed448ph."""
+        key = eddsa.import_private_key(self.ed448ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        verifier = eddsa.new(eddsa.import_public_key(self.ed448ph_pk), "rfc8032")
+
+        digest = SHAKE256.new(self.msg).read(64)
+        signature = signer.sign(digest)
+        assert signature != self.ed448ph_sig
+        verifier.verify(digest, signature)
+        with pytest.raises(ValueError):
+            verifier.verify(digest, self.ed448ph_sig)
+        with pytest.raises(ValueError):
+            verifier.verify(SHAKE256.new(self.msg), signature)
+
+    # --- Cross-mode rejection ---------------------------------------
+
+    def test_ed25519ph_signature_rejected_for_raw_message(self):
+        """An Ed25519ph signature must not verify against the raw
+        message bytes (pure mode), only against the hash object."""
+        verifier = eddsa.new(eddsa.import_public_key(self.ed25519ph_pk), "rfc8032")
+        verifier.verify(SHA512.new(self.msg), self.ed25519ph_sig)
+        with pytest.raises(ValueError):
+            verifier.verify(self.msg, self.ed25519ph_sig)
+
+    def test_ed448ph_signature_rejected_for_raw_message(self):
+        verifier = eddsa.new(eddsa.import_public_key(self.ed448ph_pk), "rfc8032")
+        verifier.verify(SHAKE256.new(self.msg), self.ed448ph_sig)
+        with pytest.raises(ValueError):
+            verifier.verify(self.msg, self.ed448ph_sig)
+
+    def test_ed25519_pure_signature_rejected_in_ph_mode(self):
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        verifier = eddsa.new(eddsa.import_public_key(self.ed25519ph_pk), "rfc8032")
+        signature = signer.sign(self.msg)
+        verifier.verify(self.msg, signature)
+        with pytest.raises(ValueError):
+            verifier.verify(SHA512.new(self.msg), signature)
+
+    def test_ed448_pure_signature_rejected_in_ph_mode(self):
+        key = eddsa.import_private_key(self.ed448ph_sk)
+        signer = eddsa.new(key, "rfc8032")
+        verifier = eddsa.new(eddsa.import_public_key(self.ed448ph_pk), "rfc8032")
+        signature = signer.sign(self.msg)
+        verifier.verify(self.msg, signature)
+        with pytest.raises(ValueError):
+            verifier.verify(SHAKE256.new(self.msg), signature)
+
+    # --- Context handling ---------------------------------------------
+
+    def test_ed25519_empty_context_equals_no_context(self):
+        """For PureEdDSA on Ed25519, context=b"" and context=None both
+        mean 'no dom2' and reproduce the RFC 8032 section 7.1 vector."""
+        # RFC 8032, section 7.1, TEST 2
+        sk = unhexlify("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+        expected = unhexlify(
+            "92a009a9f0d4cab8720e820b5f642540"
+            "a2b27b5416503f8fb3762223ebdb69da"
+            "085ac1e43e15996e458f3613d0f11d8c"
+            "387b2eaeb4302aeeb00d291612bb0c00"
+        )
+        key = eddsa.import_private_key(sk)
+        assert eddsa.new(key, "rfc8032").sign(b"\x72") == expected
+        assert eddsa.new(key, "rfc8032", context=b"").sign(b"\x72") == expected
+
+    def test_ed25519ph_empty_context_matches_rfc(self):
+        """Ed25519ph with an empty context still emits dom2 (flag=1)."""
+        key = eddsa.import_private_key(self.ed25519ph_sk)
+        signature = eddsa.new(key, "rfc8032", context=b"").sign(SHA512.new(self.msg))
+        assert signature == self.ed25519ph_sig
+        # A pure signature over the same message is necessarily different
+        assert eddsa.new(key, "rfc8032").sign(self.msg) != self.ed25519ph_sig
+
+    def test_ed25519_context_mismatch_rejected(self):
+        verifier = eddsa.new(
+            eddsa.import_public_key(self.ed25519ctx_pk), "rfc8032", context=b"foo"
+        )
+        verifier.verify(self.ed25519ctx_msg, self.ed25519ctx_sig)
+        for wrong_context in (b"", b"bar", b"foo\x00"):
+            verifier = eddsa.new(
+                eddsa.import_public_key(self.ed25519ctx_pk),
+                "rfc8032",
+                context=wrong_context,
+            )
+            with pytest.raises(ValueError):
+                verifier.verify(self.ed25519ctx_msg, self.ed25519ctx_sig)
+
+    def test_ed448_context_mismatch_rejected(self):
+        verifier = eddsa.new(
+            eddsa.import_public_key(self.ed448ctx_pk), "rfc8032", context=b"foo"
+        )
+        verifier.verify(self.ed448ctx_msg, self.ed448ctx_sig)
+        for wrong_context in (b"", b"bar", b"foo\x00"):
+            verifier = eddsa.new(
+                eddsa.import_public_key(self.ed448ctx_pk),
+                "rfc8032",
+                context=wrong_context,
+            )
+            with pytest.raises(ValueError):
+                verifier.verify(self.ed448ctx_msg, self.ed448ctx_sig)
+
+    def test_ed448ph_context_mismatch_rejected(self):
+        """RFC 8032, section 7.5: Ed448ph of "abc" with context "foo"
+        must not verify under another context."""
+        sig_foo = unhexlify(
+            "c32299d46ec8ff02b54540982814dce9a05812f81962b649d528095916a2aa48"
+            "1065b1580423ef927ecf0af5888f90da0f6a9a85ad5dc3f280d91224ba9911a3"
+            "653d00e484e2ce232521481c8658df304bb7745a73514cdb9bf3e15784ab7128"
+            "4f8d0704a608c54a6b62d97beb511d132100"
+        )
+        pk = eddsa.import_public_key(self.ed448ph_pk)
+        verifier = eddsa.new(pk, "rfc8032", context=b"foo")
+        verifier.verify(SHAKE256.new(self.msg), sig_foo)
+        for wrong_context in (b"", b"bar"):
+            verifier = eddsa.new(pk, "rfc8032", context=wrong_context)
+            with pytest.raises(ValueError):
+                verifier.verify(SHAKE256.new(self.msg), sig_foo)
+
+    # --- Input type acceptance ----------------------------------------
+
+    @pytest.mark.parametrize("curve", ["Ed25519", "Ed448"])
+    def test_bytearray_is_pure_message(self, curve):
+        """bytearray is accepted and treated exactly like bytes."""
+        key = ECC.generate(curve=curve)
+        signer = eddsa.new(key, "rfc8032")
+        assert signer.sign(bytearray(self.msg)) == signer.sign(self.msg)
+
+    @pytest.mark.parametrize(
+        "curve,wrong_hash",
+        [
+            ("Ed25519", SHA256),
+            ("Ed25519", SHAKE256),
+            ("Ed448", SHA256),
+            ("Ed448", SHA512),
+        ],
+    )
+    def test_wrong_hash_type_rejected(self, curve, wrong_hash):
+        """Only SHA-512 (Ed25519) or SHAKE256 (Ed448) objects select
+        HashEdDSA; any other hash object is a TypeError, on sign and
+        verify alike."""
+        key = ECC.generate(curve=curve)
+        signer = eddsa.new(key, "rfc8032")
+        with pytest.raises(TypeError):
+            signer.sign(wrong_hash.new(self.msg))
+        with pytest.raises(TypeError):
+            signer.verify(wrong_hash.new(self.msg), b"\x00" * 64)
+
+    @pytest.mark.parametrize("curve", ["Ed25519", "Ed448"])
+    @pytest.mark.parametrize("bad_input", ["abc", 123, None, object()])
+    def test_non_buffer_rejected(self, curve, bad_input):
+        key = ECC.generate(curve=curve)
+        signer = eddsa.new(key, "rfc8032")
+        with pytest.raises(TypeError):
+            signer.sign(bad_input)
+        with pytest.raises(TypeError):
+            signer.verify(bad_input, b"\x00" * 64)
